@@ -1,3 +1,4 @@
+import os
 import random
 import time
 from types import SimpleNamespace
@@ -46,11 +47,18 @@ class PPO:
 
         self._setup()
 
-    def _setup(self):
-        self.envs = Envs(num_envs=self.args.num_envs)
+    def _setup(self, to_train='', path_to_train=None, path_to_play=None):
+        if len(to_train) == 0:
+            self.envs = Envs(num_envs=self.args.num_envs)
+            self.agent = PolicyValueNetwork(self.envs.single_observation_space, self.envs.single_action_space).to(
+                self.device)
+        else:
+            self.envs = Envs(num_envs=self.args.num_envs, agent_to_train=to_train, path_to_model_to_play=path_to_play)
+            self.agent = PolicyValueNetwork(self.envs.single_observation_space, self.envs.single_action_space).to(
+                self.device)
+            if path_to_train is not None:
+                self.agent.load_state_dict(torch.load(path_to_train))
 
-        self.agent = PolicyValueNetwork(self.envs.single_observation_space, self.envs.single_action_space).to(
-            self.device)
         self.optimizer = optim.Adam(self.agent.parameters(), lr=self.args.learning_rate, eps=1e-5)
 
         # Storage setup
@@ -64,6 +72,7 @@ class PPO:
         self.values = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
 
     def train(self):
+        path_to_best = None
         # Start game
         global_step = 0
         start_time = time.time()
@@ -97,15 +106,15 @@ class PPO:
                 self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
                 next_obs, next_done = torch.Tensor(next_obs).to(self.device), torch.Tensor(next_done).to(self.device)
 
-                for info_dict in infos:
-                    if "final_info" in info_dict:
-                        for info in info_dict["final_info"]:
-                            if info and "episode" in info:
-                                # print(f"global_step={global_step}, episodic_return={info_dict['final_info']['episode']['r']}")
-                                self.writer.add_scalar("charts/episodic_return",
-                                                       info_dict["final_info"]["episode"]["r"], global_step)
-                                self.writer.add_scalar("charts/episodic_length",
-                                                       info_dict["final_info"]["episode"]["l"], global_step)
+                for inf in infos:
+                    if "final_info" in inf:
+                        if inf["final_info"] and "episode" in inf["final_info"]:
+                            # print(f"global_step={global_step}, episodic_return={inf['final_info']['episode']['r']}")
+                            self.writer.add_scalar("charts/episodic_return", inf["final_info"]["episode"]["r"],
+                                                   global_step)
+                            self.writer.add_scalar("charts/episodic_length", inf["final_info"]["episode"]["l"],
+                                                   global_step)
+
             # DONE ROLLOUT
 
             # LEARNING PHASE
@@ -145,6 +154,7 @@ class PPO:
             # Optimizing the policy and value network
             b_inds = np.arange(self.args.batch_size)
             clipfracs = []
+            continue_training = True
             for epoch in range(self.args.update_epochs):
                 np.random.shuffle(b_inds)  # Shuffle the data
                 for start in range(0, self.args.batch_size, self.args.minibatch_size):  # Mini-batch iteration
@@ -162,6 +172,10 @@ class PPO:
                         approx_kl = ((ratio - 1) - logratio).mean()
                         clipfracs += [((ratio - 1.0).abs() > self.args.clip_coef).float().mean().item()]
 
+                    if self.args.target_kl is not None and approx_kl > 1.5 * self.args.target_kl:
+                        continue_training = False
+                        break
+
                     mb_advantages = b_advantages[mb_inds]  # Minibatch advantages
                     if self.args.norm_adv:
                         mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)  # See
@@ -176,7 +190,7 @@ class PPO:
 
                     # Value loss
                     newvalue = newvalue.view(-1)
-                    if self.args.clip_vloss:  # Clip`loss for the value function. Impl trick 9. Disabled
+                    if self.args.clip_vloss:  # Clip loss for the value function. Impl trick 9. Disabled
                         v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                         v_clipped = b_values[mb_inds] + torch.clamp(
                             newvalue - b_values[mb_inds],
@@ -198,7 +212,7 @@ class PPO:
                     nn.utils.clip_grad_norm_(self.agent.parameters(), self.args.max_grad_norm)  # Impl trick 11
                     self.optimizer.step()
 
-                if self.args.target_kl is not None and approx_kl > self.args.target_kl:
+                if not continue_training:
                     break
 
             # Logging stuff
@@ -208,7 +222,25 @@ class PPO:
 
             self._log(global_step, start_time, v_loss, pg_loss, entropy_loss, old_approx_kl, approx_kl, clipfracs,
                       explained_var)
+
+            with torch.no_grad():
+                prev_max_reward = 0 if iteration == 1 else prev_max_reward
+                avg_reward = torch.sum(self.rewards).item() / self.args.num_envs
+                self.writer.add_scalar("charts/average_reward", avg_reward,
+                                       global_step)  # Logging average reward (obtained from playing n_steps in each env)
+
+                if not os.path.exists('models'):
+                    os.makedirs('models')
+
+                if avg_reward > prev_max_reward:
+                    torch.save(self.agent.state_dict(), f"models/{self.args.exp_name}_{iteration}.pt")
+                    path_to_best = f"models/{self.args.exp_name}_{iteration}.pt"
+                    wandb.save(f"models/{self.args.exp_name}_{iteration}.pt")
+                    print(f"Model saved with avg_reward={avg_reward}")
+                    prev_max_reward = avg_reward
+
         self._close()
+        return path_to_best
 
     def _log(self, global_step, start_time, v_loss, pg_loss, entropy_loss, old_approx_kl, approx_kl, clipfracs,
              explained_var):
@@ -231,13 +263,13 @@ class PPO:
 
 if __name__ == "__main__":
     args = SimpleNamespace(
-        exp_name='ExpV0.1',
+        exp_name='KAZ-V3.3-0',
         seed=31415926,
         wandb_project_name='KAZ-RL',
         wandb_entity="rl2024-umdacs",
         torch_deterministic=True,
         cuda=True,
-        learning_rate=1e-3,
+        learning_rate=4e-4,
         gamma=1.0,
         gae_lambda=0.95,
         clip_coef=0.2,
@@ -247,13 +279,22 @@ if __name__ == "__main__":
         vf_coef=0.5,
         max_grad_norm=0.5,
         target_kl=0.01,
-        num_envs=4,
+        num_envs=8,
         num_steps=2048,
-        num_minibatches=512,
-        total_timesteps=1000000,
+        num_minibatches=64,
+        total_timesteps=327_680,
         update_epochs=10,
         anneal_lr=True
     )
 
     ppo_trainer = PPO(args)
-    ppo_trainer.train()
+    archer_path = ppo_trainer.train()
+    for b in range(1, 6):
+        args.exp_name = f"KAZ-V3.1-{b}"
+        ppo_trainer = PPO(args)
+        ppo_trainer._setup(to_train='knight_0', path_to_train=None, path_to_play=archer_path)
+        knight_path = ppo_trainer.train()
+        args.exp_name = f"KAZ-V3.2-{b}"
+        ppo_trainer = PPO(args)
+        ppo_trainer._setup(to_train='archer_0', path_to_train=archer_path, path_to_play=knight_path)
+        archer_path = ppo_trainer.train()

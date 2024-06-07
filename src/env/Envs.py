@@ -1,11 +1,15 @@
 import numpy as np
+import torch
 from pettingzoo.butterfly import knights_archers_zombies_v10
 from supersuit import vectorize_aec_env_v0
+
+from network.PolicyValueNetwork import PolicyValueNetwork
 
 
 class Envs:
     # Wrapper for the vectorized environments. Beware AEC logic.
-    def __init__(self, num_envs, playable_agent="archer_0"):
+    def __init__(self, num_envs, agent_to_train="archer_0", path_to_model_to_play=None):
+        self.episodes_lengths = None
         self._env = knights_archers_zombies_v10.env(
             spawn_rate=20,
             num_archers=1,
@@ -20,11 +24,23 @@ class Envs:
             vector_state=True,
             use_typemasks=False,
             sequence_space=False)
-        self._playable_agent = playable_agent
+
         self._num_envs = num_envs
         self.envs = vectorize_aec_env_v0(self._env, self._num_envs)
+
+        # Playable agent is the agent we want to train.
+
+        self._playable_agent = agent_to_train
+
+        # Doesn't matter if we use the observation space of the playable agent. They are the same for all agents.
         self.single_observation_space = self.envs.observation_space(self._playable_agent)
         self.single_action_space = self.envs.action_space(self._playable_agent)
+
+        self._agent_to_play = PolicyValueNetwork(self.single_observation_space, self.single_action_space).to(
+            torch.device("cuda"))
+
+        if path_to_model_to_play is not None:  # This is the model of the agent that will play with us.
+            self._agent_to_play.load_state_dict(torch.load(path_to_model_to_play))
 
     def get_envs(self):
         return self.envs
@@ -39,7 +55,7 @@ class Envs:
     def step(self, actions):
         assert len(actions) == self._num_envs, f"Expected {self._num_envs} actions, got {len(actions)}"
 
-        playable_agent = self._playable_agent  # Agent to play
+        playable_agent = self._playable_agent  # Agent to train
 
         self.envs.step(actions)
 
@@ -47,11 +63,15 @@ class Envs:
 
         rewards = self.envs.rewards[playable_agent]  # Immediate rewards
 
-        # Other agents will play randomly:
+        # Other agents still have to play:
 
         for agent in self.envs.possible_agents:
             if agent != playable_agent:
-                self.envs.step([self.envs.action_space(agent).sample() for _ in range(self._num_envs)])
+                observations = self.envs.observe(agent)
+                observations = torch.tensor(observations).float().to(torch.device("cuda"))
+                actions = self._agent_to_play.get_actions_and_values(observations)[0]
+                actions = actions.cpu().numpy()
+                self.envs.step(actions)
                 rewards += self.envs.rewards[playable_agent]  # Collect possible updates in our rewards
 
         obs = self.envs.observe(playable_agent)  # Next observations
@@ -61,7 +81,8 @@ class Envs:
 
         for i, (termination, truncation) in enumerate(zip(terminations, truncations)):
             if termination or truncation:
-                infos[i]["final_info"] = {"episode": {"r": rewards[i], "l": self.episodes_lengths[i]}}
+                infos[i]["final_info"] = {
+                    "episode": {"r": self.envs._cumulative_rewards[playable_agent][i], "l": self.episodes_lengths[i]}}
                 self.episodes_lengths[i] = 0
 
         return obs, rewards, terminations, truncations, infos

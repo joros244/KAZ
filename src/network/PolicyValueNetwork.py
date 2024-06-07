@@ -20,18 +20,18 @@ class PolicyValueNetwork(nn.Module):
         # point
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(obs_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(obs_space.shape).prod(), 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
+            layer_init(nn.Linear(256, 1), std=1.0),
         )
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(np.array(obs_space.shape).prod(), 64)),
+            layer_init(nn.Linear(np.array(obs_space.shape).prod(), 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
+            layer_init(nn.Linear(256, 256)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, action_space.n), std=0.01),
+            layer_init(nn.Linear(256, action_space.n), std=0.01),
         )
 
     def _get_value(self, x):
