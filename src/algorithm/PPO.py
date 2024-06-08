@@ -14,6 +14,7 @@ from src.network.PolicyValueNetwork import PolicyValueNetwork
 
 
 class PPO:
+    # CleanRL PPO: https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo.py
 
     def __init__(self, args: SimpleNamespace):
         self.args = args
@@ -172,7 +173,8 @@ class PPO:
                         approx_kl = ((ratio - 1) - logratio).mean()
                         clipfracs += [((ratio - 1.0).abs() > self.args.clip_coef).float().mean().item()]
 
-                    if self.args.target_kl is not None and approx_kl > 1.5 * self.args.target_kl:
+                    if self.args.target_kl is not None and approx_kl > 1.5 * self.args.target_kl:  # If KL divergence is
+                        # too high, stop training. Target policy is too far away from the current policy!
                         continue_training = False
                         break
 
@@ -190,7 +192,8 @@ class PPO:
 
                     # Value loss
                     newvalue = newvalue.view(-1)
-                    if self.args.clip_vloss:  # Clip loss for the value function. Impl trick 9. Disabled
+                    if self.args.clip_vloss:  # Clip loss for the value function. Impl trick 9. Disabled to decrease
+                        # complexity (do not want to introduce more hyperparameters)
                         v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                         v_clipped = b_values[mb_inds] + torch.clamp(
                             newvalue - b_values[mb_inds],
